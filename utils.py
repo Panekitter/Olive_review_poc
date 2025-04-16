@@ -30,7 +30,7 @@ def is_white_background(cell_format):
 
 def process_review_file(spreadsheet, openai_key):
     """
-    対象のファイル内の行データ（C列が空かつ背景色が白の行）を抽出し、
+    対象のファイル内の行データ（C列の背景色が白の行）を抽出し、
     まとめて1回のGPT呼び出しでレビュー結果を取得、バッチ更新で反映する。
     """
     # APIキーを設定
@@ -40,22 +40,23 @@ def process_review_file(spreadsheet, openai_key):
 
     eligible_indices = []
     for i in range(1, len(rows)):
-        # まず、C列（インデックス2）が空白でないならスキップ
-        if rows[i][2].strip():
-            continue
-
         try:
             cell_format = get_user_entered_format(worksheet, f"C{i+1}")
             time.sleep(0.15)  # API制限対策
+
+            # デバッグ出力（全行のC列値と背景色を表示）
             try:
                 hex_color = rgb_to_hex(cell_format.backgroundColor)
             except Exception as e:
                 hex_color = f"取得エラー: {e}"
             if DEBUG:
-                print(f"Row {i+1}: Cセル値 = '{rows[i][2]}', 背景色 = {hex_color}")
+                c_value = rows[i][2] if len(rows[i]) > 2 else ""
+                print(f"Row {i+1}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
 
+            # 対象条件は、背景色が白 (#FFFFFF) であることのみ
             if not is_white_background(cell_format):
                 continue
+
             eligible_indices.append(i)
         except Exception as e:
             print(f"Skipping row {i+1} due to error in background color check: {e}")
@@ -113,7 +114,7 @@ def process_review_file(spreadsheet, openai_key):
                 print(f"エラー発生、行パース失敗: {line} : {e}")
                 continue
 
-    # --- バッチでシートを更新 ---
+    # --- バッチ更新でシートに書き込み ---
     cell_updates = []
     for i in eligible_indices:
         row_num = i + 1
