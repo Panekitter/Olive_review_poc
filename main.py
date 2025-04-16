@@ -16,6 +16,7 @@ def get_google_client():
 def main():
     gc = get_google_client()
     openai_key = os.getenv("OPENAI_API_KEY")
+    creds_dict = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
     master_url = os.getenv("MASTER_SPREADSHEET_URL")
     master_sheet = gc.open_by_url(master_url).sheet1
 
@@ -26,9 +27,10 @@ def main():
         try:
             spreadsheet = gc.open_by_url(url)
             print(f"Processing: {url}")
-            process_review_file(spreadsheet, openai_key)
+            process_review_file(spreadsheet, openai_key, creds_dict)
         except Exception as e:
             print(f"Error processing {url}: {e}")
+
 
 if __name__ == "__main__":
     main()
