@@ -1,15 +1,25 @@
 from openai import OpenAI
 from gspread_formatting import get_user_entered_format
-from gspread_formatting.dataframe import Color
+
+def get_context(rows, index):
+    prev_line = rows[index - 1][0] if index > 1 else ""
+    target_line = rows[index][0]
+    next_line = rows[index + 1][0] if index + 1 < len(rows) else ""
+    return prev_line, target_line, next_line
+
+def rgb_to_hex(color):
+    def to_255(v): return int(round(v * 255))
+    r = to_255(color.red if color.red is not None else 1)
+    g = to_255(color.green if color.green is not None else 1)
+    b = to_255(color.blue if color.blue is not None else 1)
+    return "#{:02X}{:02X}{:02X}".format(r, g, b)
 
 def is_white_background(cell_format):
     color = cell_format.backgroundColor
     if not color:
         return False
-    r = color.get('red', 1)
-    g = color.get('green', 1)
-    b = color.get('blue', 1)
-    return r == 1 and g == 1 and b == 1  # 完全に白（RGB 1,1,1）
+    hex_color = rgb_to_hex(color)
+    return hex_color == "#FFFFFF"
 
 def process_review_file(spreadsheet, openai_key):
     client = OpenAI(api_key=openai_key)
@@ -17,6 +27,7 @@ def process_review_file(spreadsheet, openai_key):
     rows = worksheet.get_all_values()
 
     for i in range(1, len(rows)):
+        # C列の背景色が白かチェック
         cell_format = get_user_entered_format(worksheet, f"C{i+1}")
         if not is_white_background(cell_format):
             continue
