@@ -9,7 +9,7 @@ DEBUG = True
 def rgb_to_hex_obj(bg):
     """
     bg は辞書 { "red": float, "green": float, "blue": float } として渡されると仮定し、
-    それを #RRGGBB 形式の文字列に変換します。
+    それを "#RRGGBB" 形式の文字列に変換します。
     """
     r = bg.get('red', 1)
     g = bg.get('green', 1)
@@ -18,24 +18,26 @@ def rgb_to_hex_obj(bg):
 
 def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
     """
-    指定されたシート（sheet_title）の、C列（ヘッダー除く "C2:C"）について、
-    effectiveFormat の情報を 1 回の API 呼び出しで取得し、
-    シート上の行番号（2行目～）をキーとする辞書を返します。
+    指定されたシート（sheet_title）の、C列（ヘッダー除く "C2:C"）
+    に対し、userEnteredFormat の情報を 1 回の API 呼び出しで取得し、
+    シート上の行番号（2 行目～）をキーとする辞書を返します。
+    
+    ※ セルに対して明示的に書式が設定されていない場合は、書式情報は返りません。
     """
     scope = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     service = build('sheets', 'v4', credentials=creds)
-    # 範囲は、シート名と "C2:C" として指定（ヘッダーは1行目）
+    # 範囲は "Task!C2:C"（ヘッダーは1行目なので除く）
     range_str = f"{sheet_title}!C2:C"
-    # effectiveFormat を取得（userEnteredFormat ではなく、計算済みの効果的な書式情報）
-    fields = "sheets(data(rowData(values(effectiveFormat))))"
+    # fields には userEnteredFormat のみを指定
+    fields = "sheets(data(rowData(values(userEnteredFormat))))"
     result = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
         ranges=[range_str],
         fields=fields
     ).execute()
     formats = {}
-    # result の中から対象シートを探す
+    # 対象シートを探す
     for sheet in result.get('sheets', []):
         props = sheet.get('properties', {})
         if props.get('title') == sheet_title:
@@ -44,13 +46,13 @@ def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
                 break
             rowData = data[0].get('rowData', [])
             for i, row in enumerate(rowData):
-                # 実際のシート行番号は、ヘッダーが1行目なので i + 2
+                # 実際のシート行番号（ヘッダーが1行目の場合）＝ i + 2
                 row_number = i + 2
                 values = row.get('values', [])
-                # 範囲 "C2:C" は1列だけなので、0 番目の値が該当するセル
-                if len(values) > 0:
-                    effective_fmt = values[0].get('effectiveFormat', {})
-                    bg = effective_fmt.get('backgroundColor', None)
+                # 範囲 "C2:C" は1列のみなので、値は先頭の要素
+                if len(values) > 0 and 'userEnteredFormat' in values[0]:
+                    fmt = values[0]['userEnteredFormat']
+                    bg = fmt.get('backgroundColor', None)
                     if bg is not None:
                         try:
                             hex_color = rgb_to_hex_obj(bg)
@@ -66,9 +68,9 @@ def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
 
 def get_context(data, j):
     """
-    data: ヘッダー除くのデータ行リスト（各行はリスト）
+    data: ヘッダー除くデータ行のリスト（各行はリスト）
     j: data 内の 0-indexed 行番号
-    前後文脈として、前行と次行の A列の値を返します。
+    前後文脈として、前の行および次の行の A列の値を返します。
     """
     prev_line = data[j-1][0] if j > 0 else ""
     target_line = data[j][0]
@@ -78,13 +80,16 @@ def get_context(data, j):
 def is_white_background(hex_color):
     """
     文字列としての背景色 (例: "#FFFFFF") を受け取り、白であるか判定します。
+    ※ この場合、明示的に "#FFFFFF" と設定されているセルのみが対象となります。
     """
     return hex_color == "#FFFFFF"
 
 def process_review_file(spreadsheet, openai_key, creds_dict):
     """
-    対象ファイル内のデータ行（ヘッダー除く）のうち、C列の効果的背景色が白 (#FFFFFF) である行を対象とし、
-    前後文脈とともにプロンプトを作成、GPTに依頼し、結果でシートをバッチ更新します。
+    対象ファイル内のデータ行（ヘッダー除く）のうち、C列の userEnteredFormat で
+    背景色が白 (#FFFFFF) と明示的に設定されている行のみを対象とし、
+    前後文脈を含むプロンプトを作成して GPT にレビューを依頼し、
+    返された結果でシートをバッチ更新します。
     """
     openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
@@ -92,23 +97,24 @@ def process_review_file(spreadsheet, openai_key, creds_dict):
     if len(rows) < 2:
         print("データ行がありません。")
         return
-    # ヘッダー行を除いたデータリスト
+    # ヘッダー除くデータ行を抽出
     data = rows[1:]
     total_data_rows = len(data)
     spreadsheet_id = spreadsheet.id
     sheet_title = "Task"
-    # C列の書式（効果的背景色）を一括取得（実際のシート行番号がキー）
+    # 列C (ヘッダー除く) の書式情報（userEnteredFormat）を 1 回で取得
     format_dict = get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict)
     
-    eligible_indices = []  # data 内のインデックス (0-indexed)
+    eligible_indices = []  # data 内の 0-indexed 行番号
     for j in range(total_data_rows):
-        row_num = j + 2  # シート上の行番号
-        hex_color = format_dict.get(row_num)
+        # シート上の行番号 = j + 2
+        row_num = j + 2
+        hex_color = format_dict.get(row_num)  # 明示的に設定されていない場合は None
         if DEBUG:
             c_value = data[j][2] if len(data[j]) > 2 else ""
             print(f"Row {row_num}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
-        # 対象条件：背景色が白 (#FFFFFF)
-        if not hex_color or not is_white_background(hex_color):
+        # 対象は、書式情報が存在し、かつ背景色が明示的に "#FFFFFF" である行のみ
+        if hex_color != "#FFFFFF":
             continue
         eligible_indices.append(j)
     
@@ -123,7 +129,6 @@ def process_review_file(spreadsheet, openai_key, creds_dict):
     prompt += "【出力フォーマット】\n"
     prompt += "行番号: 修正翻訳 | エラー分類 | エラー理由（必要な場合）\n"
     prompt += "-----------------------------\n\n"
-
     for j in eligible_indices:
         prev, target, next_ = get_context(data, j)
         row_num = j + 2
@@ -133,7 +138,7 @@ def process_review_file(spreadsheet, openai_key, creds_dict):
         prompt += f"後文: {next_}\n"
         prompt += f"初回日本語訳: {data[j][1]}\n"
         prompt += "-----------------------------\n"
-
+    
     # --- GPT API 呼び出し ---
     response = openai.ChatCompletion.create(
         model="gpt-4o",
