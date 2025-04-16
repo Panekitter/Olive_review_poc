@@ -110,11 +110,22 @@ def process_review_file(spreadsheet, openai_key):
 
     # --- GPT API 用プロンプト作成 ---
     prompt = ("以下は翻訳レビュー対象データです。それぞれの行について、"
-              "修正翻訳、エラー分類、エラー理由（エラー分類がotherの場合のみ）を、"
-              "シート上の行番号ごとに以下のフォーマットで返してください。\n")
+            "以下の【エラー分類の選択肢】の中から最も該当するものを1つ選び、"
+            "修正翻訳、エラー分類、エラー理由（エラー分類が 'Other' の場合のみ）を返してください。\n\n")
+    prompt += "【エラー分類の選択肢】\n"
+    prompt += "1. Major Error - Difficult or impossible to understand\n"
+    prompt += "2. Major Error - Meaning is not preserved\n"
+    prompt += "3. Major Error - Translation is offensive (when the original was not)\n"
+    prompt += "4. Major Error - Translation is offensive - misgendering (when the original was not)\n"
+    prompt += "5. Major Error - Source text is incomprehensible\n"
+    prompt += "6. Minor Error - Meaning preserved but awkward or slightly difficult to understand\n"
+    prompt += "7. Minor Error - Source and translation text are misaligned\n"
+    prompt += "8. Other\n"
+    prompt += "※ 'misaligned' とは、該当のセルの翻訳が前後のセルとずれて入ってしまっているというエラーを意味します。\n\n"
     prompt += "【出力フォーマット】\n"
     prompt += "行番号: 修正翻訳 | エラー分類 | エラー理由（必要な場合）\n"
     prompt += "-----------------------------\n\n"
+
 
     for j in eligible_indices:
         prev, target, next_ = get_context(data, j)
