@@ -28,7 +28,7 @@ def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
     # 範囲は、シート名と "C2:C" として指定（ヘッダーは1行目）
     range_str = f"{sheet_title}!C2:C"
     # effectiveFormat を取得（userEnteredFormat ではなく、計算済みの効果的な書式情報）
-    fields = "sheets(data(rowData(values(effectiveFormat)))"
+    fields = "sheets(data(rowData(values(effectiveFormat))))"
     result = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
         ranges=[range_str],
