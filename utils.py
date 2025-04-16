@@ -1,3 +1,4 @@
+import time
 from openai import OpenAI
 from gspread_formatting import get_user_entered_format
 
@@ -27,13 +28,16 @@ def process_review_file(spreadsheet, openai_key):
     rows = worksheet.get_all_values()
 
     for i in range(1, len(rows)):
-        # C列の背景色が白かチェック
-        cell_format = get_user_entered_format(worksheet, f"C{i+1}")
-        if not is_white_background(cell_format):
-            continue
+        try:
+            # 背景色取得（セル位置はC列 = 3列目）
+            cell_format = get_user_entered_format(worksheet, f"C{i+1}")
+            time.sleep(0.2)  # API制限回避（1分300回以内）
 
-        prev, target, next_ = get_context(rows, i)
-        prompt = f"""以下の英文は口語表現が含まれた文字起こしです。
+            if not is_white_background(cell_format):
+                continue
+
+            prev, target, next_ = get_context(rows, i)
+            prompt = f"""以下の英文は口語表現が含まれた文字起こしです。
 中央の英文を翻訳レビューしてください。前後の文脈も参考にして翻訳精度を改善してください。
 
 前文: {prev}
@@ -47,18 +51,22 @@ def process_review_file(spreadsheet, openai_key):
 3. otherの理由（あれば、英語で簡潔に）
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-        )
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+            )
 
-        result = response.choices[0].message.content.splitlines()
-        revised = result[0].strip()
-        category = result[1].strip() if len(result) > 1 else ""
-        explanation = result[2].strip() if len(result) > 2 else ""
+            result = response.choices[0].message.content.splitlines()
+            revised = result[0].strip()
+            category = result[1].strip() if len(result) > 1 else ""
+            explanation = result[2].strip() if len(result) > 2 else ""
 
-        worksheet.update_cell(i+1, 3, revised)
-        worksheet.update_cell(i+1, 4, category)
-        if category.lower() == "other":
-            worksheet.update_cell(i+1, 5, explanation)
+            worksheet.update_cell(i+1, 3, revised)
+            worksheet.update_cell(i+1, 4, category)
+            if category.lower() == "other":
+                worksheet.update_cell(i+1, 5, explanation)
+
+        except Exception as e:
+            print(f"Skipped row {i+1} due to error: {e}")
+            continue
