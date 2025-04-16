@@ -112,6 +112,7 @@ def process_review_file(spreadsheet, openai_key):
     prompt = ("以下は翻訳レビュー対象データです。それぞれの行について、"
             "以下の【エラー分類の選択肢】の中から最も該当するものを1つ選び、"
             "修正翻訳、エラー分類、エラー理由（エラー分類が 'Other' の場合のみ）を返してください。\n\n")
+    prompt += "ただし、エラーの分類は翻訳を修正した場合のみ返してください。\n"
     prompt += "【エラー分類の選択肢】\n"
     prompt += "Major Error - Difficult or impossible to understand\n"
     prompt += "Major Error - Meaning is not preserved\n"
