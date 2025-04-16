@@ -2,3 +2,7 @@ openai==0.28
 gspread
 oauth2client
 gspread-formatting
+
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
