@@ -1,8 +1,7 @@
 import time
 import openai
-from gspread_formatting import get_user_entered_format
+from gspread_formatting import get_user_entered_formats
 
-# DEBUG フラグ：True にすると各行の背景色を出力します
 DEBUG = True
 
 def get_context(rows, index):
@@ -13,7 +12,7 @@ def get_context(rows, index):
     return prev_line, target_line, next_line
 
 def rgb_to_hex(color):
-    def to_255(v): 
+    def to_255(v):
         return int(round(v * 255))
     r = to_255(color.red if color.red is not None else 1)
     g = to_255(color.green if color.green is not None else 1)
@@ -30,43 +29,50 @@ def is_white_background(cell_format):
 
 def process_review_file(spreadsheet, openai_key):
     """
-    対象のファイル内の行データ（C列の背景色が白の行）を抽出し、
+    対象のファイル内の行データについて、C列の背景色が白 (#FFFFFF) のセルを対象とし、
     まとめて1回のGPT呼び出しでレビュー結果を取得、バッチ更新で反映する。
     """
-    # APIキーを設定
     openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
-    rows = worksheet.get_all_values()  # シート全行を一括取得
+    rows = worksheet.get_all_values()  # シート全行取得
+
+    # バッチで C列 (範囲: C2 から C{n}) の書式情報を取得
+    total_rows = len(rows)
+    range_str = f"C2:C{total_rows}"  # ヘッダー以降すべて
+    try:
+        cell_formats = get_user_entered_formats(worksheet, range_str)
+    except Exception as e:
+        print(f"Error in batch retrieving formats for range {range_str}: {e}")
+        return
 
     eligible_indices = []
-    for i in range(1, len(rows)):
-        try:
-            cell_format = get_user_entered_format(worksheet, f"C{i+1}")
-            time.sleep(0.15)  # API制限対策
-
-            # デバッグ出力（全行のC列値と背景色を表示）
-            try:
-                hex_color = rgb_to_hex(cell_format.backgroundColor)
-            except Exception as e:
-                hex_color = f"取得エラー: {e}"
+    # cell_formats は、キーがセルアドレス（例 "C2", "C3", …）で返ると仮定
+    for i in range(1, total_rows):
+        cell_address = f"C{i+1}"
+        cell_format = cell_formats.get(cell_address)
+        if not cell_format:
             if DEBUG:
-                c_value = rows[i][2] if len(rows[i]) > 2 else ""
-                print(f"Row {i+1}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
-
-            # 対象条件は、背景色が白 (#FFFFFF) であることのみ
-            if not is_white_background(cell_format):
-                continue
-
-            eligible_indices.append(i)
-        except Exception as e:
-            print(f"Skipping row {i+1} due to error in background color check: {e}")
+                print(f"Row {i+1}: No format data for {cell_address}")
             continue
+
+        try:
+            hex_color = rgb_to_hex(cell_format.backgroundColor) if cell_format.backgroundColor else "None"
+        except Exception as e:
+            hex_color = f"取得エラー: {e}"
+        if DEBUG:
+            c_value = rows[i][2] if len(rows[i]) > 2 else ""
+            print(f"Row {i+1}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
+        # 判定条件は背景色が #FFFFFF かどうかのみ
+        if not is_white_background(cell_format):
+            continue
+
+        eligible_indices.append(i)
 
     if not eligible_indices:
         print("該当する対象行は見つかりませんでした。")
         return
 
-    # --- まとめて1回のAPI呼び出し用プロンプト作成 ---
+    # --- まとめて1回のGPT API呼び出し用プロンプト作成 ---
     prompt = ("以下は翻訳レビュー対象データです。それぞれの行について、"
               "修正翻訳、エラー分類、エラー理由（エラー分類がotherの場合のみ）を、"
               "行番号ごとに以下のフォーマットで返してください。\n")
@@ -83,7 +89,7 @@ def process_review_file(spreadsheet, openai_key):
         prompt += f"初回日本語訳: {rows[i][1]}\n"
         prompt += "-----------------------------\n"
 
-    # --- 1回のGPT API呼び出し ---
+    # --- 1回の GPT API 呼び出し ---
     response = openai.ChatCompletion.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -94,7 +100,7 @@ def process_review_file(spreadsheet, openai_key):
     # 期待する出力例：
     # 行 2: 修正訳文 | 誤訳 | 理由
     # 行 5: 修正訳文 | 不自然 | 
-    # … といった形式
+    # … の形式で返す
     results = {}
     for line in result_text.splitlines():
         line = line.strip()
