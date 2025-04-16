@@ -1,51 +1,56 @@
 import time
 import re
 import openai
-import json
 from googleapiclient.discovery import build
 from oauth2client.service_account import ServiceAccountCredentials
 
 DEBUG = True
 
-# ----- セルの背景色を dict から hex 表記に変換する関数 ----- 
 def rgb_to_hex_obj(bg):
-    # bg は辞書。たとえば { "red": 1, "green": 1, "blue": 1 } なら白
+    """
+    bg は辞書 { "red": float, "green": float, "blue": float } として渡されると仮定し、
+    それを #RRGGBB 形式の文字列に変換します。
+    """
     r = bg.get('red', 1)
     g = bg.get('green', 1)
     b = bg.get('blue', 1)
     return "#{:02X}{:02X}{:02X}".format(int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
 
-# ----- 指定されたシートの範囲（例："Task!C2:C"）の書式情報を一括取得する -----
 def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
-    # 認証情報を作成
+    """
+    指定されたシート（sheet_title）の、C列（ヘッダー除く "C2:C"）について、
+    effectiveFormat の情報を 1 回の API 呼び出しで取得し、
+    シート上の行番号（2行目～）をキーとする辞書を返します。
+    """
     scope = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     service = build('sheets', 'v4', credentials=creds)
-    # 対象範囲はシート名と "C2:C" として、ヘッダー（1行目）は除く
+    # 範囲は、シート名と "C2:C" として指定（ヘッダーは1行目）
     range_str = f"{sheet_title}!C2:C"
-    # fields パラメータを設定して、userEnteredFormat 情報のみを取得する
-    fields = "sheets(data(rowData(values(userEnteredFormat))))"
+    # effectiveFormat を取得（userEnteredFormat ではなく、計算済みの効果的な書式情報）
+    fields = "sheets(data(rowData(values(effectiveFormat)))"
     result = service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
         ranges=[range_str],
         fields=fields
     ).execute()
     formats = {}
-    # result には sheets のリストがあります。対象シートタイトルのものを探す。
+    # result の中から対象シートを探す
     for sheet in result.get('sheets', []):
         props = sheet.get('properties', {})
         if props.get('title') == sheet_title:
-            # data はリスト（通常 1つ）
             data = sheet.get('data', [])
             if not data:
                 break
             rowData = data[0].get('rowData', [])
             for i, row in enumerate(rowData):
-                # 実際のシート行番号は、ヘッダーが1行目なので i+2
+                # 実際のシート行番号は、ヘッダーが1行目なので i + 2
                 row_number = i + 2
                 values = row.get('values', [])
-                if len(values) > 2 and 'userEnteredFormat' in values[2]:
-                    bg = values[2]['userEnteredFormat'].get('backgroundColor', None)
+                # 範囲 "C2:C" は1列だけなので、0 番目の値が該当するセル
+                if len(values) > 0:
+                    effective_fmt = values[0].get('effectiveFormat', {})
+                    bg = effective_fmt.get('backgroundColor', None)
                     if bg is not None:
                         try:
                             hex_color = rgb_to_hex_obj(bg)
@@ -60,41 +65,50 @@ def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
     return formats
 
 def get_context(data, j):
-    """data: ヘッダー除くデータ行リスト, j: 0-index（データ行の番号）"""
+    """
+    data: ヘッダー除くのデータ行リスト（各行はリスト）
+    j: data 内の 0-indexed 行番号
+    前後文脈として、前行と次行の A列の値を返します。
+    """
     prev_line = data[j-1][0] if j > 0 else ""
     target_line = data[j][0]
     next_line = data[j+1][0] if j+1 < len(data) else ""
     return prev_line, target_line, next_line
 
+def is_white_background(hex_color):
+    """
+    文字列としての背景色 (例: "#FFFFFF") を受け取り、白であるか判定します。
+    """
+    return hex_color == "#FFFFFF"
+
 def process_review_file(spreadsheet, openai_key, creds_dict):
     """
-    対象ファイル内のデータ行（ヘッダー除く）のうち、C列の背景色が白 (#FFFFFF) の行を対象として、
-    前後文脈を含むプロンプトを作成し、GPTにレビュー依頼、得られた結果でシートを更新する。
+    対象ファイル内のデータ行（ヘッダー除く）のうち、C列の効果的背景色が白 (#FFFFFF) である行を対象とし、
+    前後文脈とともにプロンプトを作成、GPTに依頼し、結果でシートをバッチ更新します。
     """
     openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
-    rows = worksheet.get_all_values()
+    rows = worksheet.get_all_values()  # 全行取得（ヘッダー含む）
     if len(rows) < 2:
         print("データ行がありません。")
         return
-    # ヘッダー行を除いたデータ部分
+    # ヘッダー行を除いたデータリスト
     data = rows[1:]
     total_data_rows = len(data)
     spreadsheet_id = spreadsheet.id
     sheet_title = "Task"
-    # 1回の API 呼び出しで列Cの書式情報をまとめて取得
+    # C列の書式（効果的背景色）を一括取得（実際のシート行番号がキー）
     format_dict = get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict)
     
-    eligible_indices = []  # 0-indexed data 行番号
+    eligible_indices = []  # data 内のインデックス (0-indexed)
     for j in range(total_data_rows):
-        # 実際のシート行番号 = j+2
-        row_num = j + 2
-        # 書式情報がない場合は、今回は対象外とする
+        row_num = j + 2  # シート上の行番号
         hex_color = format_dict.get(row_num)
         if DEBUG:
             c_value = data[j][2] if len(data[j]) > 2 else ""
             print(f"Row {row_num}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
-        if hex_color != "#FFFFFF":
+        # 対象条件：背景色が白 (#FFFFFF)
+        if not hex_color or not is_white_background(hex_color):
             continue
         eligible_indices.append(j)
     
@@ -104,19 +118,8 @@ def process_review_file(spreadsheet, openai_key, creds_dict):
 
     # --- GPT API 用プロンプト作成 ---
     prompt = ("以下は翻訳レビュー対象データです。それぞれの行について、"
-            "以下の【エラー分類の選択肢】の中から最も該当するものを1つ選び、"
-            "修正翻訳、エラー分類、エラー理由（エラー分類が 'Other' の場合のみ）を返してください。\n\n")
-    prompt += "ただし、エラーの分類は翻訳を修正した場合のみ返してください。\n"
-    prompt += "【エラー分類の選択肢】\n"
-    prompt += "Major Error - Difficult or impossible to understand\n"
-    prompt += "Major Error - Meaning is not preserved\n"
-    prompt += "Major Error - Translation is offensive (when the original was not)\n"
-    prompt += "Major Error - Translation is offensive - misgendering (when the original was not)\n"
-    prompt += "Major Error - Source text is incomprehensible\n"
-    prompt += "Minor Error - Meaning preserved but awkward or slightly difficult to understand\n"
-    prompt += "Minor Error - Source and translation text are misaligned\n"
-    prompt += "Other\n"
-    prompt += "※ 'misaligned' とは、該当のセルの翻訳が前後のセルとずれて入ってしまっているというエラーを意味します。\n\n"
+              "修正翻訳、エラー分類、エラー理由（エラー分類がotherの場合のみ）を、"
+              "シート上の実際の行番号ごとに以下のフォーマットで返してください。\n")
     prompt += "【出力フォーマット】\n"
     prompt += "行番号: 修正翻訳 | エラー分類 | エラー理由（必要な場合）\n"
     prompt += "-----------------------------\n\n"
