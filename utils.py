@@ -1,16 +1,50 @@
+import time
+import openai
+from gspread_formatting import get_user_entered_format
+
+# DEBUG フラグ：True にすると各行の背景色を出力します
+DEBUG = True
+
+def get_context(rows, index):
+    """対象行の前後文脈（A列）の値を取得する"""
+    prev_line = rows[index - 1][0] if index > 1 else ""
+    target_line = rows[index][0]
+    next_line = rows[index + 1][0] if index + 1 < len(rows) else ""
+    return prev_line, target_line, next_line
+
+def rgb_to_hex(color):
+    def to_255(v): 
+        return int(round(v * 255))
+    r = to_255(color.red if color.red is not None else 1)
+    g = to_255(color.green if color.green is not None else 1)
+    b = to_255(color.blue if color.blue is not None else 1)
+    return "#{:02X}{:02X}{:02X}".format(r, g, b)
+
+def is_white_background(cell_format):
+    """背景色が完全な白 (#FFFFFF) か判定する"""
+    color = cell_format.backgroundColor
+    if not color:
+        return False
+    hex_color = rgb_to_hex(color)
+    return hex_color == "#FFFFFF"
+
 def process_review_file(spreadsheet, openai_key):
     """
     対象のファイル内の行データ（C列が空かつ背景色が白の行）を抽出し、
     まとめて1回のGPT呼び出しでレビュー結果を取得、バッチ更新で反映する。
     """
-    client = OpenAI(api_key=openai_key)
+    # APIキーを設定
+    openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
     rows = worksheet.get_all_values()  # シート全行を一括取得
 
     eligible_indices = []
     for i in range(1, len(rows)):
+        # まず、C列（インデックス2）が空白でないならスキップ
+        if rows[i][2].strip():
+            continue
+
         try:
-            # --- まず、全行のC列情報（値と背景色）を取得し、デバッグ出力する ---
             cell_format = get_user_entered_format(worksheet, f"C{i+1}")
             time.sleep(0.15)  # API制限対策
             try:
@@ -20,13 +54,8 @@ def process_review_file(spreadsheet, openai_key):
             if DEBUG:
                 print(f"Row {i+1}: Cセル値 = '{rows[i][2]}', 背景色 = {hex_color}")
 
-            # --- その後、対象チェック ---
-            if rows[i][2].strip():
-                # C列に何か値がある場合は、対象外
-                continue
             if not is_white_background(cell_format):
                 continue
-
             eligible_indices.append(i)
         except Exception as e:
             print(f"Skipping row {i+1} due to error in background color check: {e}")
@@ -54,7 +83,7 @@ def process_review_file(spreadsheet, openai_key):
         prompt += "-----------------------------\n"
 
     # --- 1回のGPT API呼び出し ---
-    response = client.chat.completions.create(
+    response = openai.ChatCompletion.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5,
@@ -84,7 +113,7 @@ def process_review_file(spreadsheet, openai_key):
                 print(f"エラー発生、行パース失敗: {line} : {e}")
                 continue
 
-    # --- バッチ更新でシートに書き込み ---
+    # --- バッチでシートを更新 ---
     cell_updates = []
     for i in eligible_indices:
         row_num = i + 1

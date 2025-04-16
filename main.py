@@ -19,7 +19,8 @@ def main():
     master_url = os.getenv("MASTER_SPREADSHEET_URL")
     master_sheet = gc.open_by_url(master_url).sheet1
 
-    urls = master_sheet.col_values(1)[1:]  # A列の2行目以降がPoC対象
+    # MASTERシートのA列2行目以降の全URLを対象
+    urls = master_sheet.col_values(1)[1:]
 
     for url in urls:
         try:
