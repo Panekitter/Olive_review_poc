@@ -1,9 +1,8 @@
 import json
 import gspread
-import openai
+import os
 from oauth2client.service_account import ServiceAccountCredentials
 from utils import process_review_file
-import os
 
 def get_google_client():
     creds_dict = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
@@ -17,12 +16,11 @@ def get_google_client():
 def main():
     gc = get_google_client()
     openai_key = os.getenv("OPENAI_API_KEY")
-
-    # 管理用マスターシート（1列目にURLあり）
     master_url = os.getenv("MASTER_SPREADSHEET_URL")
     master_sheet = gc.open_by_url(master_url).sheet1
 
-    urls = master_sheet.col_values(1)[1:]  # A列の2行目以降がPoC対象
+    # MASTERシートのA列2行目以降の全URLを対象
+    urls = master_sheet.col_values(1)[1:]
 
     for url in urls:
         try:

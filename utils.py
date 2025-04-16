@@ -2,8 +2,11 @@ import time
 from openai import OpenAI
 from gspread_formatting import get_user_entered_format
 
+# DEBUG フラグ：True にすると各行の背景色を出力します
+DEBUG = True
+
 def get_context(rows, index):
-    """前後文脈の抽出（対象行の1つ上と1つ下のA列の値）"""
+    """対象行の前後文脈（A列）の値を取得する"""
     prev_line = rows[index - 1][0] if index > 1 else ""
     target_line = rows[index][0]
     next_line = rows[index + 1][0] if index + 1 < len(rows) else ""
@@ -18,6 +21,7 @@ def rgb_to_hex(color):
     return "#{:02X}{:02X}{:02X}".format(r, g, b)
 
 def is_white_background(cell_format):
+    """背景色が完全な白 (#FFFFFF) か判定する"""
     color = cell_format.backgroundColor
     if not color:
         return False
@@ -26,25 +30,31 @@ def is_white_background(cell_format):
 
 def process_review_file(spreadsheet, openai_key):
     """
-    対象のファイル内の行データ（C列が空かつ背景色が白の行）を一括でGPTに渡してレビューし、
-    バッチ更新で結果を書き込む。
+    対象のファイル内の行データ（C列が空かつ背景色が白の行）を抽出し、
+    まとめて1回のGPT呼び出しでレビュー結果を取得、バッチ更新で反映する。
     """
     client = OpenAI(api_key=openai_key)
     worksheet = spreadsheet.worksheet("Task")
-    rows = worksheet.get_all_values()  # すべての行を取得
+    rows = worksheet.get_all_values()  # シート全行を一括取得
 
-    # 対象行のインデックス（ヘッダーは除くので1以降）
     eligible_indices = []
     for i in range(1, len(rows)):
-        # C列（インデックス2）が空白かどうかチェック
+        # まず、C列（インデックス2）が空白でないならスキップ
         if rows[i][2].strip():
             continue
 
-        # C列の背景色を取得（各セルごとに呼ぶが、これをまとめて処理はできないので必要回数発生）
         try:
             cell_format = get_user_entered_format(worksheet, f"C{i+1}")
-            # ※ API制限対策としては、ここで minimal sleep を入れる
-            time.sleep(0.15)
+            time.sleep(0.15)  # API制限対策
+
+            # DEBUG出力：背景色の取得結果
+            try:
+                hex_color = rgb_to_hex(cell_format.backgroundColor)
+            except Exception as e:
+                hex_color = f"取得エラー: {e}"
+            if DEBUG:
+                print(f"Row {i+1}: 背景色 = {hex_color}")
+
             if not is_white_background(cell_format):
                 continue
             eligible_indices.append(i)
@@ -57,15 +67,15 @@ def process_review_file(spreadsheet, openai_key):
         return
 
     # --- まとめて1回のAPI呼び出し用プロンプト作成 ---
-    # 行ごとに番号とともに、前文、本文、後文、初回訳（B列）の情報を記述
-    prompt = "以下は翻訳レビュー対象データです。それぞれの行について、修正翻訳、エラー分類、エラー理由（エラー分類がotherの場合のみ）を、行番号ごとに以下のフォーマットで返してください。\n"
+    prompt = ("以下は翻訳レビュー対象データです。それぞれの行について、"
+              "修正翻訳、エラー分類、エラー理由（エラー分類がotherの場合のみ）を、"
+              "行番号ごとに以下のフォーマットで返してください。\n")
     prompt += "【出力フォーマット】\n"
     prompt += "行番号: 修正翻訳 | エラー分類 | エラー理由（必要な場合）\n"
     prompt += "-----------------------------\n\n"
 
     for i in eligible_indices:
         prev, target, next_ = get_context(rows, i)
-        # i+1 は実際のシートの行番号
         prompt += f"行 {i+1}:\n"
         prompt += f"前文: {prev}\n"
         prompt += f"本文: {target}\n"
@@ -73,7 +83,7 @@ def process_review_file(spreadsheet, openai_key):
         prompt += f"初回日本語訳: {rows[i][1]}\n"
         prompt += "-----------------------------\n"
 
-    # --- 1回のAPI呼び出し ---
+    # --- 1回のGPT API呼び出し ---
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -81,20 +91,17 @@ def process_review_file(spreadsheet, openai_key):
     )
 
     result_text = response.choices[0].message.content
-    # 期待する出力形式の例（GPTに依頼するフォーマットに沿って）：
-    # 行 2: 修正訳文 | 誤訳 | 理由（例: 原文の「...」は正しい訳ではない）
+    # 期待する出力例：
+    # 行 2: 修正訳文 | 誤訳 | 理由
     # 行 5: 修正訳文 | 不自然 | 
-    # …
-    # 結果をパースする
+    # … といった形式
     results = {}
     for line in result_text.splitlines():
         line = line.strip()
         if not line:
             continue
-        # 例： "行 2: 修正訳文 | 誤訳 | 理由"
         if line.startswith("行"):
             try:
-                # 行番号部分と本文を分割
                 parts = line.split(":", 1)
                 row_num_str = parts[0].replace("行", "").strip()
                 row_num = int(row_num_str)
@@ -107,7 +114,7 @@ def process_review_file(spreadsheet, openai_key):
                 print(f"エラー発生、行パース失敗: {line} : {e}")
                 continue
 
-    # --- バッチでシートを更新 ---
+    # --- バッチ更新でシートに書き込み ---
     cell_updates = []
     for i in eligible_indices:
         row_num = i + 1
