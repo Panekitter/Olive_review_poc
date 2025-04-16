@@ -1,8 +1,34 @@
 import time
+import re
 import openai
-from gspread_formatting import get_user_entered_formats
+from gspread_formatting import get_user_entered_format  # 個別取得は個々のセル用
 
 DEBUG = True
+
+def get_user_entered_formats(worksheet, range_str):
+    """
+    指定された範囲 (例: "C2:C{total_rows}") の各セル書式情報を取得して、
+    セルアドレスをキーとする辞書を返す関数です。
+    ※ 一括で取得する関数は gspread_formatting には用意されていないため、
+      指定範囲のセルを個別に取得し、辞書にまとめる実装例です。
+    """
+    # 範囲文字列が "C<start>:C<end>" 形式であることを確認
+    m = re.match(r"C(\d+):C(\d+)", range_str)
+    if not m:
+        raise ValueError(f"セル範囲の形式が正しくありません: {range_str}")
+    start = int(m.group(1))
+    end = int(m.group(2))
+    formats = {}
+    for row in range(start, end + 1):
+        cell_address = f"C{row}"
+        try:
+            fmt = get_user_entered_format(worksheet, cell_address)
+            formats[cell_address] = fmt
+            time.sleep(0.1)  # API呼び出し間の待機でレート制限軽減
+        except Exception as e:
+            formats[cell_address] = None
+            print(f"{cell_address} 書式取得エラー: {e}")
+    return formats
 
 def get_context(rows, index):
     """対象行の前後文脈（A列）の値を取得する"""
@@ -29,16 +55,16 @@ def is_white_background(cell_format):
 
 def process_review_file(spreadsheet, openai_key):
     """
-    対象のファイル内の行データについて、C列の背景色が白 (#FFFFFF) のセルを対象とし、
-    まとめて1回のGPT呼び出しでレビュー結果を取得、バッチ更新で反映する。
+    対象のファイル内の全行（ヘッダー除く）のうち、C列の背景色が白 (#FFFFFF) 
+    の行を対象とし、まとめて1回のGPT呼び出しで各行のレビュー結果を取得して、
+    batch_update() によりシートに反映する。
     """
     openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
     rows = worksheet.get_all_values()  # シート全行取得
-
-    # バッチで C列 (範囲: C2 から C{n}) の書式情報を取得
     total_rows = len(rows)
-    range_str = f"C2:C{total_rows}"  # ヘッダー以降すべて
+    # バッチで C列 (範囲: C2 から C{total_rows}) の書式情報を取得
+    range_str = f"C2:C{total_rows}"
     try:
         cell_formats = get_user_entered_formats(worksheet, range_str)
     except Exception as e:
@@ -46,7 +72,6 @@ def process_review_file(spreadsheet, openai_key):
         return
 
     eligible_indices = []
-    # cell_formats は、キーがセルアドレス（例 "C2", "C3", …）で返ると仮定
     for i in range(1, total_rows):
         cell_address = f"C{i+1}"
         cell_format = cell_formats.get(cell_address)
@@ -62,10 +87,9 @@ def process_review_file(spreadsheet, openai_key):
         if DEBUG:
             c_value = rows[i][2] if len(rows[i]) > 2 else ""
             print(f"Row {i+1}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
-        # 判定条件は背景色が #FFFFFF かどうかのみ
+        # 対象条件：背景色が #FFFFFF
         if not is_white_background(cell_format):
             continue
-
         eligible_indices.append(i)
 
     if not eligible_indices:
@@ -89,7 +113,7 @@ def process_review_file(spreadsheet, openai_key):
         prompt += f"初回日本語訳: {rows[i][1]}\n"
         prompt += "-----------------------------\n"
 
-    # --- 1回の GPT API 呼び出し ---
+    # --- 1回のGPT API呼び出し ---
     response = openai.ChatCompletion.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -97,10 +121,6 @@ def process_review_file(spreadsheet, openai_key):
     )
 
     result_text = response.choices[0].message.content
-    # 期待する出力例：
-    # 行 2: 修正訳文 | 誤訳 | 理由
-    # 行 5: 修正訳文 | 不自然 | 
-    # … の形式で返す
     results = {}
     for line in result_text.splitlines():
         line = line.strip()
