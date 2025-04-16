@@ -1,109 +1,103 @@
 import time
 import re
 import openai
-from gspread_formatting import get_user_entered_format
+import json
+from googleapiclient.discovery import build
+from oauth2client.service_account import ServiceAccountCredentials
 
 DEBUG = True
 
-def get_user_entered_formats(worksheet, range_str):
-    """
-    指定された範囲（例："C2:C{total_rows}"）の各セル書式情報を取得し、
-    セルアドレス（例 "C2", "C3", …）をキーとする辞書を返す関数です。
-    ※ gspread_formatting には一括取得関数がないため、各セル毎に個別取得してまとめます。
-    """
-    m = re.match(r"C(\d+):C(\d+)", range_str)
-    if not m:
-        raise ValueError(f"セル範囲の形式が正しくありません: {range_str}")
-    start = int(m.group(1))
-    end = int(m.group(2))
+# ----- セルの背景色を dict から hex 表記に変換する関数 ----- 
+def rgb_to_hex_obj(bg):
+    # bg は辞書。たとえば { "red": 1, "green": 1, "blue": 1 } なら白
+    r = bg.get('red', 1)
+    g = bg.get('green', 1)
+    b = bg.get('blue', 1)
+    return "#{:02X}{:02X}{:02X}".format(int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+# ----- 指定されたシートの範囲（例："Task!C2:C"）の書式情報を一括取得する -----
+def get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict):
+    # 認証情報を作成
+    scope = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    service = build('sheets', 'v4', credentials=creds)
+    # 対象範囲はシート名と "C2:C" として、ヘッダー（1行目）は除く
+    range_str = f"{sheet_title}!C2:C"
+    # fields パラメータを設定して、userEnteredFormat 情報のみを取得する
+    fields = "sheets(data(rowData(values(userEnteredFormat))))"
+    result = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        ranges=[range_str],
+        fields=fields
+    ).execute()
     formats = {}
-    for row in range(start, end + 1):
-        cell_address = f"C{row}"
-        try:
-            fmt = get_user_entered_format(worksheet, cell_address)
-            formats[cell_address] = fmt
-            time.sleep(0.1)  # レート制限対策
-        except Exception as e:
-            formats[cell_address] = None
-            print(f"{cell_address} 書式取得エラー: {e}")
+    # result には sheets のリストがあります。対象シートタイトルのものを探す。
+    for sheet in result.get('sheets', []):
+        props = sheet.get('properties', {})
+        if props.get('title') == sheet_title:
+            # data はリスト（通常 1つ）
+            data = sheet.get('data', [])
+            if not data:
+                break
+            rowData = data[0].get('rowData', [])
+            for i, row in enumerate(rowData):
+                # 実際のシート行番号は、ヘッダーが1行目なので i+2
+                row_number = i + 2
+                values = row.get('values', [])
+                if len(values) > 2 and 'userEnteredFormat' in values[2]:
+                    bg = values[2]['userEnteredFormat'].get('backgroundColor', None)
+                    if bg is not None:
+                        try:
+                            hex_color = rgb_to_hex_obj(bg)
+                        except Exception as e:
+                            hex_color = f"Error: {e}"
+                        formats[row_number] = hex_color
+                    else:
+                        formats[row_number] = None
+                else:
+                    formats[row_number] = None
+            break
     return formats
 
 def get_context(data, j):
-    """
-    data: ヘッダーを除いたデータ行のリスト
-    j: data における行番号 (0-indexed)
-    前後文脈として、前のデータ行と次のデータ行の A列の値を返す。
-    ヘッダーは除くので、利用できない場合は空文字を返します。
-    """
+    """data: ヘッダー除くデータ行リスト, j: 0-index（データ行の番号）"""
     prev_line = data[j-1][0] if j > 0 else ""
     target_line = data[j][0]
     next_line = data[j+1][0] if j+1 < len(data) else ""
     return prev_line, target_line, next_line
 
-def rgb_to_hex(color):
-    def to_255(v):
-        return int(round(v * 255))
-    r = to_255(color.red if color.red is not None else 1)
-    g = to_255(color.green if color.green is not None else 1)
-    b = to_255(color.blue if color.blue is not None else 1)
-    return "#{:02X}{:02X}{:02X}".format(r, g, b)
-
-def is_white_background(cell_format):
-    """背景色が完全な白 (#FFFFFF) か判定する"""
-    color = cell_format.backgroundColor
-    if not color:
-        return False
-    hex_color = rgb_to_hex(color)
-    return hex_color == "#FFFFFF"
-
-def process_review_file(spreadsheet, openai_key):
+def process_review_file(spreadsheet, openai_key, creds_dict):
     """
-    対象のファイル内のデータ行（ヘッダー除く）のうち、C列の背景色が白 (#FFFFFF)
-    のセルを対象として、前後文脈を利用した翻訳レビューのプロンプトを構築し、
-    1回のGPT呼び出しでレビュー結果を取得し、バッチ更新でシートに反映する。
-    
-    ※ 書式情報が取得できなかった場合は、背景色は白 (#FFFFFF) と仮定します。
+    対象ファイル内のデータ行（ヘッダー除く）のうち、C列の背景色が白 (#FFFFFF) の行を対象として、
+    前後文脈を含むプロンプトを作成し、GPTにレビュー依頼、得られた結果でシートを更新する。
     """
     openai.api_key = openai_key
     worksheet = spreadsheet.worksheet("Task")
-    rows = worksheet.get_all_values()  # 全行取得（ヘッダー含む）
+    rows = worksheet.get_all_values()
     if len(rows) < 2:
         print("データ行がありません。")
         return
-
-    # header を除くデータ行のみを抽出
+    # ヘッダー行を除いたデータ部分
     data = rows[1:]
     total_data_rows = len(data)
-    # C列 (データ部分) の書式情報取得範囲は「C2:C{total_data_rows+1}」
-    range_str = f"C2:C{total_data_rows+1}"
-    try:
-        cell_formats = get_user_entered_formats(worksheet, range_str)
-    except Exception as e:
-        print(f"Error in batch retrieving formats for range {range_str}: {e}")
-        return
-
-    eligible_indices = []
+    spreadsheet_id = spreadsheet.id
+    sheet_title = "Task"
+    # 1回の API 呼び出しで列Cの書式情報をまとめて取得
+    format_dict = get_c_column_formatting(spreadsheet_id, sheet_title, creds_dict)
+    
+    eligible_indices = []  # 0-indexed data 行番号
     for j in range(total_data_rows):
-        cell_address = f"C{j+2}"  # ヘッダー行が1行目なので、最初のデータ行は行2
-        cell_format = cell_formats.get(cell_address)
-        # 書式情報が取得できない場合は、デフォルト背景＝白 (#FFFFFF) と仮定
-        if cell_format is None:
-            is_white = True
-            hex_color = "#FFFFFF"
-        else:
-            try:
-                hex_color = rgb_to_hex(cell_format.backgroundColor) if cell_format.backgroundColor else "None"
-            except Exception as e:
-                hex_color = f"取得エラー: {e}"
-            is_white = is_white_background(cell_format)
+        # 実際のシート行番号 = j+2
+        row_num = j + 2
+        # 書式情報がない場合は、今回は対象外とする
+        hex_color = format_dict.get(row_num)
         if DEBUG:
             c_value = data[j][2] if len(data[j]) > 2 else ""
-            # 実際のシート行番号は j+2
-            print(f"Row {j+2}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
-        if not is_white:
+            print(f"Row {row_num}: Cセル値 = '{c_value}', 背景色 = {hex_color}")
+        if hex_color != "#FFFFFF":
             continue
         eligible_indices.append(j)
-
+    
     if not eligible_indices:
         print("該当する対象行は見つかりませんでした。")
         return
@@ -127,11 +121,10 @@ def process_review_file(spreadsheet, openai_key):
     prompt += "行番号: 修正翻訳 | エラー分類 | エラー理由（必要な場合）\n"
     prompt += "-----------------------------\n\n"
 
-
     for j in eligible_indices:
         prev, target, next_ = get_context(data, j)
-        # シート上の行番号は j+2
-        prompt += f"行 {j+2}:\n"
+        row_num = j + 2
+        prompt += f"行 {row_num}:\n"
         prompt += f"前文: {prev}\n"
         prompt += f"本文: {target}\n"
         prompt += f"後文: {next_}\n"
@@ -167,7 +160,7 @@ def process_review_file(spreadsheet, openai_key):
     # --- バッチ更新でシートに書き込み ---
     cell_updates = []
     for j in eligible_indices:
-        row_num = j+2
+        row_num = j + 2
         if row_num in results:
             revised, category, explanation = results[row_num]
             cell_updates.append({
